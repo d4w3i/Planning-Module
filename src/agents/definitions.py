@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ from src.agents.states.structured_output import FinalPlan
 from src.agents.tools.function_context import get_function_context
 from src.agents.tools.navigation import glob_tool, grep, ls, read
 from src.agents.tools.repo_context import RepoContext
+from src.repo_handling.get_patch_info import parse_patch
 
 
 def _setup_langsmith_tracing() -> None:
@@ -94,4 +96,22 @@ def final_planner_prompt(issue_report: str, specification: str) -> str:
     return (
         f"<issue_report>\n{issue_report}\n</issue_report>\n\n"
         f"<specification>\n{specification}\n</specification>"
+    )
+
+
+ground_truth_planner = Agent[RepoContext](
+    name="ground_truth_planner",
+    instructions=_load_prompt("ground_truth_planner.txt"),
+    tools=[read, ls, glob_tool, grep, get_function_context],
+    output_type=FinalPlan,
+    model=MODEL,
+)
+
+
+def ground_truth_planner_prompt(issue_report: str, diff_patch: str) -> str:
+    parsed = parse_patch(diff_patch)
+    return (
+        f"<issue_report>\n{issue_report}\n</issue_report>\n\n"
+        f"<gold_patch>\n{diff_patch}\n</gold_patch>\n\n"
+        f"<gold_patch_parsed>\n{json.dumps(parsed, indent=2)}\n</gold_patch_parsed>"
     )

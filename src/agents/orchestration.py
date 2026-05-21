@@ -9,6 +9,8 @@ from agents import Runner
 from src.agents.definitions import (
     final_planner,
     final_planner_prompt,
+    ground_truth_planner,
+    ground_truth_planner_prompt,
     issue_preprocessor,
     issue_preprocessor_prompt,
     localization,
@@ -87,6 +89,75 @@ async def run_planning_pipeline(problem_statement: str, structure: dict) -> Fina
     return plan.final_output
 
 
+async def run_ground_truth_pipeline(
+    problem_statement: str, structure: dict, diff_patch: str
+) -> FinalPlan:
+    """Produce the GROUND-TRUTH FinalPlan for one issue from its gold patch.
+
+    Unlike run_planning_pipeline, which never sees the solution, this pipeline is
+    handed the real merged diff and works backwards from it:
+      1. issue_preprocessor   — raw issue text -> structured JSON issue report.
+      2. ground_truth_planner — issue report + gold patch -> structured FinalPlan,
+         with line numbers verified against the base-commit repository via tools.
+
+    The plan is emitted in the same FinalPlan format as the blind pipeline, so it
+    can serve as the reference for evaluating blind plans.
+
+    Args:
+        problem_statement: The raw GitHub issue text (SWE-bench problem_statement).
+        structure: The repository structure dict (base commit, from create_structure).
+        diff_patch: The gold solution patch (SWE-bench 'patch' field).
+
+    Returns:
+        The ground-truth FinalPlan produced by the ground_truth_planner agent.
+    """
+    logger.info("ground-truth stage 1/2: issue_preprocessor")
+    pre = await Runner.run(
+        issue_preprocessor, issue_preprocessor_prompt(problem_statement)
+    )
+    issue_report = pre.final_output
+
+    # The planner navigates the base-commit repo to anchor line numbers.
+    ctx = RepoContext(structure=structure)
+    try:
+        logger.info("ground-truth stage 2/2: ground_truth_planner")
+        plan = await Runner.run(
+            ground_truth_planner,
+            ground_truth_planner_prompt(issue_report, diff_patch),
+            context=ctx,
+        )
+    finally:
+        ctx.cleanup()
+
+    return plan.final_output
+
+
+async def run_ground_truth_from_instance(
+    instance: dict, playground: str = "playground"
+) -> FinalPlan:
+    """Build the base-commit structure for a SWE-bench instance and produce its
+    ground-truth FinalPlan from the instance's gold patch.
+
+    Args:
+        instance: A SWE-bench instance carrying 'repo', 'base_commit',
+            'instance_id', 'problem_statement', and 'patch' (the gold diff).
+        playground: Base directory for the temporary clone (created if absent).
+
+    Returns:
+        The ground-truth FinalPlan for the instance.
+    """
+    d = await asyncio.to_thread(
+        get_project_structure_from_scratch,
+        instance["repo"],
+        instance["base_commit"],
+        instance["instance_id"],
+        playground,
+    )
+    return await run_ground_truth_pipeline(
+        instance["problem_statement"], d["structure"], instance["patch"]
+    )
+
+
 async def run_from_instance(instance: dict, playground: str = "playground") -> FinalPlan:
     """Build the repository structure for a SWE-bench instance and plan it.
 
@@ -149,6 +220,48 @@ async def run_and_store(
     return results
 
 
+async def run_and_store_ground_truth(
+    instances: list[dict],
+    output_path: str = "results/ground_truth_plans.json",
+    playground: str = "playground",
+) -> list[dict]:
+    """Build ground-truth plans for a batch of SWE-bench instances and store
+    every FinalPlan in one JSON array file.
+
+    The output mirrors run_and_store's format exactly — a list of
+    ``{"instance_id": ..., "plan": <FinalPlan dict>}`` — so a ground-truth file
+    can be compared entry-for-entry against a blind-pipeline file. The output's
+    parent directory is created if missing. The file is rewritten after each
+    instance, so completed plans survive a crash mid-batch. An instance that
+    fails to plan is logged and skipped rather than aborting the whole batch.
+
+    Args:
+        instances: SWE-bench instances (each with 'repo', 'base_commit',
+            'instance_id', 'problem_statement', and 'patch').
+        output_path: Path to the combined JSON array file.
+        playground: Base directory for the temporary clones.
+
+    Returns:
+        The list of stored {instance_id, plan} records.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    results: list[dict] = []
+    for instance in instances:
+        instance_id = instance.get("instance_id", "<unknown>")
+        try:
+            plan = await run_ground_truth_from_instance(instance, playground=playground)
+        except Exception:
+            logger.exception("failed to build ground-truth plan for %s", instance_id)
+            continue
+        results.append({"instance_id": instance_id, "plan": plan.model_dump()})
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(
+            "stored ground-truth plan for %s (%d total)", instance_id, len(results)
+        )
+    return results
+
+
 def load_instances(dataset: str, split: str, limit: int | None) -> list[dict]:
     """Load SWE-bench instances from a HuggingFace dataset or a local JSONL file.
 
@@ -197,8 +310,15 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="plans.json",
-        help="Path to the combined JSON array output (default: plans.json).",
+        default=None,
+        help="Path to the combined JSON array output (default: plans.json for the "
+        "blind pipeline, results/ground_truth_plans.json with --ground-truth).",
+    )
+    parser.add_argument(
+        "--ground-truth",
+        action="store_true",
+        help="Build ground-truth plans from each instance's gold patch instead of "
+        "running the blind planning pipeline.",
     )
     parser.add_argument(
         "--playground",
@@ -214,12 +334,17 @@ def main() -> None:
     instances = load_instances(args.dataset, args.split, args.limit)
     logger.info("loaded %d instances from %s", len(instances), args.dataset)
 
+    if args.ground_truth:
+        output = args.output or "results/ground_truth_plans.json"
+        store = run_and_store_ground_truth
+    else:
+        output = args.output or "plans.json"
+        store = run_and_store
+
     results = asyncio.run(
-        run_and_store(instances, output_path=args.output, playground=args.playground)
+        store(instances, output_path=output, playground=args.playground)
     )
-    logger.info(
-        "done: %d/%d plans stored to %s", len(results), len(instances), args.output
-    )
+    logger.info("done: %d/%d plans stored to %s", len(results), len(instances), output)
 
 
 if __name__ == "__main__":

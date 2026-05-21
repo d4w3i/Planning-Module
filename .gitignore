@@ -8,3 +8,4 @@ build/
 .python-version
 pyproject.toml
 uv.lock
+*.json
